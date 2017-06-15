@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2003 Bilibili
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2013-2015 Zhang Rui <bbcallen@gmail.com>
  *
@@ -58,6 +59,8 @@
 #endif
 
 #include <stdbool.h>
+#include "ijkavformat/ijkiomanager.h"
+#include "ijkavformat/ijkioapplication.h"
 #include "ff_ffinc.h"
 #include "ff_ffmsg_queue.h"
 #include "ff_ffpipenode.h"
@@ -101,7 +104,7 @@
 /* AV sync correction is done if above the maximum AV sync threshold */
 #define AV_SYNC_THRESHOLD_MAX 0.1
 /* If a frame duration is longer than this, it will not be duplicated to compensate AV sync */
-#define AV_SYNC_FRAMEDUP_THRESHOLD 0.1
+#define AV_SYNC_FRAMEDUP_THRESHOLD 0.15
 /* no AV correction is done if too big error */
 #define AV_NOSYNC_THRESHOLD 100.0
 
@@ -123,8 +126,14 @@
 /* TODO: We assume that a decoded and resampled frame fits into this buffer */
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
 
+#define MIN_PKT_DURATION 15
+
+#define MAX_KEY_FRAME_INTERVAL 1000  // max key frame interval is 1000
+
 #ifdef FFP_MERGE
 #define CURSOR_HIDE_DELAY 1000000
+
+#define USE_ONEPASS_SUBTITLE_RENDER 1
 
 static unsigned sws_flags = SWS_BICUBIC;
 #endif
@@ -183,20 +192,22 @@ typedef struct Clock {
 /* Common struct for handling all types of decoded data and allocated render buffers. */
 typedef struct Frame {
     AVFrame *frame;
-#ifdef FFP_MERGE
     AVSubtitle sub;
-    AVSubtitleRect **subrects;  /* rescaled subtitle rectangles in yuva */
-#endif
     int serial;
     double pts;           /* presentation timestamp for the frame */
     double duration;      /* estimated duration of the frame */
     int64_t pos;          /* byte position of the frame in the input file */
+#ifdef FFP_MERGE
+    SDL_Texture *bmp;
+#else
     SDL_VoutOverlay *bmp;
+#endif
     int allocated;
-    int reallocate;
     int width;
     int height;
+    int format;
     AVRational sar;
+    int uploaded;
 } Frame;
 
 typedef struct FrameQueue {
@@ -266,24 +277,17 @@ typedef struct VideoState {
     Clock extclk;
 
     FrameQueue pictq;
-#ifdef FFP_MERGE
     FrameQueue subpq;
-#endif
     FrameQueue sampq;
 
     Decoder auddec;
     Decoder viddec;
-#ifdef FFP_MERGE
     Decoder subdec;
-
-    int viddec_width;
-    int viddec_height;
-#endif
 
     int audio_stream;
 
     int av_sync_type;
-
+    void *handle;
     double audio_clock;
     int audio_clock_serial;
     double audio_diff_cum; /* used for AV difference average computation */
@@ -293,11 +297,12 @@ typedef struct VideoState {
     AVStream *audio_st;
     PacketQueue audioq;
     int audio_hw_buf_size;
-    uint8_t silence_buf[SDL_AUDIO_MIN_BUFFER_SIZE];
     uint8_t *audio_buf;
     uint8_t *audio_buf1;
+    short *audio_new_buf;  /* for soundtouch buf */
     unsigned int audio_buf_size; /* in bytes */
     unsigned int audio_buf1_size;
+    unsigned int audio_new_buf_size;
     int audio_buf_index; /* in bytes */
     int audio_write_buf_size;
     int audio_volume;
@@ -325,12 +330,14 @@ typedef struct VideoState {
     int xpos;
 #endif
     double last_vis_time;
-
 #ifdef FFP_MERGE
+    SDL_Texture *vis_texture;
+    SDL_Texture *sub_texture;
+#endif
+
     int subtitle_stream;
     AVStream *subtitle_st;
     PacketQueue subtitleq;
-#endif
 
     double frame_timer;
     double frame_last_returned_time;
@@ -339,12 +346,9 @@ typedef struct VideoState {
     AVStream *video_st;
     PacketQueue videoq;
     double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
-#if !CONFIG_AVFILTER
     struct SwsContext *img_convert_ctx;
-#endif
 #ifdef FFP_SUB
     struct SwsContext *sub_convert_ctx;
-    SDL_Rect last_display_rect;
 #endif
     int eof;
 
@@ -378,6 +382,17 @@ typedef struct VideoState {
     int is_video_high_res; // above 1080p
 
     PacketQueue *buffer_indicator_queue;
+
+    volatile int latest_seek_load_serial;
+    volatile int64_t latest_seek_load_start_at;
+
+    int drop_aframe_count;
+    int drop_vframe_count;
+    int audio_accurate_seek_req;
+    int video_accurate_seek_req;
+    SDL_mutex *accurate_seek_mutex;
+    SDL_cond  *video_accurate_seek_cond;
+    SDL_cond  *audio_accurate_seek_cond;
 } VideoState;
 
 /* options specified by the user */
@@ -385,8 +400,6 @@ typedef struct VideoState {
 static AVInputFormat *file_iformat;
 static const char *input_filename;
 static const char *window_title;
-static int fs_screen_width;
-static int fs_screen_height;
 static int default_width  = 640;
 static int default_height = 480;
 static int screen_width  = 0;
@@ -435,7 +448,8 @@ static AVPacket eof_pkt;
 #define FF_ALLOC_EVENT   (SDL_USEREVENT)
 #define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
 
-static SDL_Surface *screen;
+static SDL_Window *window;
+static SDL_Renderer *renderer;
 #endif
 
 /*****************************************************************************
@@ -462,7 +476,19 @@ typedef struct FFStatistic
     FFTrackCacheStatistic video_cache;
     FFTrackCacheStatistic audio_cache;
 
+    int64_t buf_backwards;
+    int64_t buf_forwards;
+    int64_t buf_capacity;
     SDL_SpeedSampler2 tcp_read_sampler;
+    int64_t latest_seek_load_duration;
+    int64_t byte_count;
+    int64_t cache_physical_pos;
+    int64_t cache_buf_forwards;
+    int64_t cache_file_pos;
+    int64_t cache_count_bytes;
+    int drop_frame_count;
+    int decode_frame_count;
+    float drop_frame_rate;
 } FFStatistic;
 
 #define FFP_TCP_READ_SAMPLE_RANGE 2000
@@ -511,6 +537,7 @@ typedef struct FFPlayer {
     AVDictionary *sws_dict;
     AVDictionary *player_opts;
     AVDictionary *swr_opts;
+    AVDictionary *swr_preset_opts;
 
     /* ffplay options specified by the user */
 #ifdef FFP_MERGE
@@ -528,9 +555,7 @@ typedef struct FFPlayer {
 #endif
     int audio_disable;
     int video_disable;
-#ifdef FFP_MERGE
     int subtitle_disable;
-#endif
     const char* wanted_stream_spec[AVMEDIA_TYPE_NB];
     int seek_by_bytes;
     int display_disable;
@@ -550,12 +575,11 @@ typedef struct FFPlayer {
     int loop;
     int framedrop;
     int64_t seek_at_start;
+    int subtitle;
     int infinite_buffer;
     enum ShowMode show_mode;
     char *audio_codec_name;
-#ifdef FFP_MERGE
     char *subtitle_codec_name;
-#endif
     char *video_codec_name;
     double rdftspeed;
 #ifdef FFP_MERGE
@@ -591,6 +615,7 @@ typedef struct FFPlayer {
 
     char *video_codec_info;
     char *audio_codec_info;
+    char *subtitle_codec_info;
     Uint32 overlay_format;
 
     int last_error;
@@ -610,23 +635,29 @@ typedef struct FFPlayer {
     int packet_buffering;
     int pictq_size;
     int max_fps;
+    int startup_volume;
 
     int videotoolbox;
     int vtb_max_frame_width;
     int vtb_async;
     int vtb_wait_async;
+    int vtb_handle_resolution_change;
 
     int mediacodec_all_videos;
     int mediacodec_avc;
     int mediacodec_hevc;
     int mediacodec_mpeg2;
+    int mediacodec_mpeg4;
+    int mediacodec_handle_resolution_change;
     int mediacodec_auto_rotate;
 
     int opensles;
+    int soundtouch_enable;
 
     char *iformat_name;
 
     int no_time_adjust;
+    double preset_5_1_center_mix_level;
 
     struct IjkMediaMeta *meta;
 
@@ -640,12 +671,19 @@ typedef struct FFPlayer {
     int         af_changed;
     float       pf_playback_rate;
     int         pf_playback_rate_changed;
+    float       pf_playback_volume;
+    int         pf_playback_volume_changed;
 
     void               *inject_opaque;
+    void               *ijkio_inject_opaque;
     FFStatistic         stat;
     FFDemuxCacheControl dcc;
 
     AVApplicationContext *app_ctx;
+    IjkIOManagerContext *ijkio_manager_ctx;
+
+    int enable_accurate_seek;
+    int mediacodec_sync;
 } FFPlayer;
 
 #define fftime_to_milliseconds(ts) (av_rescale(ts, 1000, AV_TIME_BASE))
@@ -662,6 +700,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     av_dict_free(&ffp->sws_dict);
     av_dict_free(&ffp->player_opts);
     av_dict_free(&ffp->swr_opts);
+    av_dict_free(&ffp->swr_preset_opts);
 
     /* ffplay options specified by the user */
     av_freep(&ffp->input_filename);
@@ -710,6 +749,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
 
     av_freep(&ffp->video_codec_info);
     av_freep(&ffp->audio_codec_info);
+    av_freep(&ffp->subtitle_codec_info);
     ffp->overlay_format         = SDL_FCC_RV32;
 
     ffp->last_error             = 0;
@@ -720,6 +760,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->start_on_prepared      = 1;
     ffp->first_video_frame_rendered = 0;
     ffp->sync_av_start          = 1;
+    ffp->enable_accurate_seek   = 0;
 
     ffp->playable_duration_ms           = 0;
 
@@ -730,15 +771,18 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->videotoolbox                   = 0; // option
     ffp->vtb_max_frame_width            = 0; // option
     ffp->vtb_async                      = 0; // option
+    ffp->vtb_handle_resolution_change   = 0; // option
     ffp->vtb_wait_async                 = 0; // option
 
     ffp->mediacodec_all_videos          = 0; // option
     ffp->mediacodec_avc                 = 0; // option
     ffp->mediacodec_hevc                = 0; // option
     ffp->mediacodec_mpeg2               = 0; // option
+    ffp->mediacodec_handle_resolution_change = 0; // option
     ffp->mediacodec_auto_rotate         = 0; // option
 
     ffp->opensles                       = 0; // option
+    ffp->soundtouch_enable              = 0; // option
 
     ffp->iformat_name                   = NULL; // option
 
@@ -754,12 +798,16 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->af_changed                     = 0;
     ffp->pf_playback_rate               = 1.0f;
     ffp->pf_playback_rate_changed       = 0;
+    ffp->pf_playback_volume             = 1.0f;
+    ffp->pf_playback_volume_changed     = 0;
 
     av_application_closep(&ffp->app_ctx);
+    ijkio_manager_destroyp(&ffp->ijkio_manager_ctx);
 
     msg_queue_flush(&ffp->msg_queue);
 
     ffp->inject_opaque = NULL;
+    ffp->ijkio_inject_opaque = NULL;
     ffp_reset_statistic(&ffp->stat);
     ffp_reset_demux_cache_control(&ffp->dcc);
 }
@@ -774,6 +822,10 @@ inline static void ffp_notify_msg2(FFPlayer *ffp, int what, int arg1) {
 
 inline static void ffp_notify_msg3(FFPlayer *ffp, int what, int arg1, int arg2) {
     msg_queue_put_simple3(&ffp->msg_queue, what, arg1, arg2);
+}
+
+inline static void ffp_notify_msg4(FFPlayer *ffp, int what, int arg1, int arg2, void *obj, int obj_len) {
+    msg_queue_put_simple4(&ffp->msg_queue, what, arg1, arg2, obj, obj_len);
 }
 
 inline static void ffp_remove_msg(FFPlayer *ffp, int what) {

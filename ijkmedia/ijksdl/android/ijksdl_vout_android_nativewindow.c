@@ -2,6 +2,7 @@
  * ijksdl_vout_android_nativewindow.c
  *****************************************************************************
  *
+ * Copyright (c) 2013 Bilibili
  * copyright (c) 2013 Zhang Rui <bbcallen@gmail.com>
  *
  * This file is part of ijkPlayer.
@@ -262,7 +263,7 @@ static void SDL_VoutAndroid_SetNativeWindow_l(SDL_Vout *vout, ANativeWindow *nat
             SDL_VoutAndroid_invalidateAllBuffers_l(vout);
         }
         return;
-    } else
+    }
 
     IJK_EGL_terminate(opaque->egl);
     SDL_VoutAndroid_invalidateAllBuffers_l(vout);

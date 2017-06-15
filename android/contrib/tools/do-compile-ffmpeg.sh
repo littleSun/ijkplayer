@@ -29,6 +29,9 @@ set -e
 #--------------------
 # common defines
 FF_ARCH=$1
+FF_BUILD_OPT=$2
+echo "FF_ARCH=$FF_ARCH"
+echo "FF_BUILD_OPT=$FF_BUILD_OPT"
 if [ -z "$FF_ARCH" ]; then
     echo "You must specific an architecture 'arm, armv7a, x86, ...'."
     echo ""
@@ -45,6 +48,9 @@ FF_SOURCE=
 FF_CROSS_PREFIX=
 FF_DEP_OPENSSL_INC=
 FF_DEP_OPENSSL_LIB=
+
+FF_DEP_LIBSOXR_INC=
+FF_DEP_LIBSOXR_LIB=
 
 FF_CFG_FLAGS=
 
@@ -72,6 +78,7 @@ FF_GCC_64_VER=$IJK_GCC_64_VER
 if [ "$FF_ARCH" = "armv7a" ]; then
     FF_BUILD_NAME=ffmpeg-armv7a
     FF_BUILD_NAME_OPENSSL=openssl-armv7a
+    FF_BUILD_NAME_LIBSOXR=libsoxr-armv7a
     FF_SOURCE=$FF_BUILD_ROOT/$FF_BUILD_NAME
 
     FF_CROSS_PREFIX=arm-linux-androideabi
@@ -89,6 +96,7 @@ if [ "$FF_ARCH" = "armv7a" ]; then
 elif [ "$FF_ARCH" = "armv5" ]; then
     FF_BUILD_NAME=ffmpeg-armv5
     FF_BUILD_NAME_OPENSSL=openssl-armv5
+    FF_BUILD_NAME_LIBSOXR=libsoxr-armv5
     FF_SOURCE=$FF_BUILD_ROOT/$FF_BUILD_NAME
 
     FF_CROSS_PREFIX=arm-linux-androideabi
@@ -104,6 +112,7 @@ elif [ "$FF_ARCH" = "armv5" ]; then
 elif [ "$FF_ARCH" = "x86" ]; then
     FF_BUILD_NAME=ffmpeg-x86
     FF_BUILD_NAME_OPENSSL=openssl-x86
+    FF_BUILD_NAME_LIBSOXR=libsoxr-x86
     FF_SOURCE=$FF_BUILD_ROOT/$FF_BUILD_NAME
 
     FF_CROSS_PREFIX=i686-linux-android
@@ -121,6 +130,7 @@ elif [ "$FF_ARCH" = "x86_64" ]; then
 
     FF_BUILD_NAME=ffmpeg-x86_64
     FF_BUILD_NAME_OPENSSL=openssl-x86_64
+    FF_BUILD_NAME_LIBSOXR=libsoxr-x86_64
     FF_SOURCE=$FF_BUILD_ROOT/$FF_BUILD_NAME
 
     FF_CROSS_PREFIX=x86_64-linux-android
@@ -138,6 +148,7 @@ elif [ "$FF_ARCH" = "arm64" ]; then
 
     FF_BUILD_NAME=ffmpeg-arm64
     FF_BUILD_NAME_OPENSSL=openssl-arm64
+    FF_BUILD_NAME_LIBSOXR=libsoxr-arm64
     FF_SOURCE=$FF_BUILD_ROOT/$FF_BUILD_NAME
 
     FF_CROSS_PREFIX=aarch64-linux-android
@@ -171,6 +182,8 @@ FF_SYSROOT=$FF_TOOLCHAIN_PATH/sysroot
 FF_PREFIX=$FF_BUILD_ROOT/build/$FF_BUILD_NAME/output
 FF_DEP_OPENSSL_INC=$FF_BUILD_ROOT/build/$FF_BUILD_NAME_OPENSSL/output/include
 FF_DEP_OPENSSL_LIB=$FF_BUILD_ROOT/build/$FF_BUILD_NAME_OPENSSL/output/lib
+FF_DEP_LIBSOXR_INC=$FF_BUILD_ROOT/build/$FF_BUILD_NAME_LIBSOXR/output/include
+FF_DEP_LIBSOXR_LIB=$FF_BUILD_ROOT/build/$FF_BUILD_NAME_LIBSOXR/output/lib
 
 case "$UNAME_S" in
     CYGWIN_NT-*)
@@ -181,7 +194,7 @@ esac
 
 
 mkdir -p $FF_PREFIX
-mkdir -p $FF_SYSROOT
+# mkdir -p $FF_SYSROOT
 
 
 FF_TOOLCHAIN_TOUCH="$FF_TOOLCHAIN_PATH/touch"
@@ -234,9 +247,16 @@ if [ -f "${FF_DEP_OPENSSL_LIB}/libssl.a" ]; then
     FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-openssl"
 
     FF_CFLAGS="$FF_CFLAGS -I${FF_DEP_OPENSSL_INC}"
-    FF_DEP_LIBS="-L${FF_DEP_OPENSSL_LIB} -lssl -lcrypto"
+    FF_DEP_LIBS="$FF_DEP_LIBS -L${FF_DEP_OPENSSL_LIB} -lssl -lcrypto"
 fi
 
+if [ -f "${FF_DEP_LIBSOXR_LIB}/libsoxr.a" ]; then
+    echo "libsoxr detected"
+    FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-libsoxr"
+
+    FF_CFLAGS="$FF_CFLAGS -I${FF_DEP_LIBSOXR_INC}"
+    FF_DEP_LIBS="$FF_DEP_LIBS -L${FF_DEP_LIBSOXR_LIB} -lsoxr"
+fi
 
 FF_CFG_FLAGS="$FF_CFG_FLAGS $COMMON_FF_CFG_FLAGS"
 
@@ -251,9 +271,26 @@ FF_CFG_FLAGS="$FF_CFG_FLAGS --target-os=linux"
 FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-pic"
 # FF_CFG_FLAGS="$FF_CFG_FLAGS --disable-symver"
 
-# Optimization options (experts only):
-FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-asm"
-FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-inline-asm"
+if [ "$FF_ARCH" = "x86" ]; then
+    FF_CFG_FLAGS="$FF_CFG_FLAGS --disable-asm"
+else
+    # Optimization options (experts only):
+    FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-asm"
+    FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-inline-asm"
+fi
+
+case "$FF_BUILD_OPT" in
+    debug)
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --disable-optimizations"
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-debug"
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --disable-small"
+    ;;
+    *)
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-optimizations"
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-debug"
+        FF_CFG_FLAGS="$FF_CFG_FLAGS --enable-small"
+    ;;
+esac
 
 #--------------------
 echo ""
@@ -277,7 +314,7 @@ echo "--------------------"
 echo "[*] compile ffmpeg"
 echo "--------------------"
 cp config.* $FF_PREFIX
-make $FF_MAKE_FLAGS
+make $FF_MAKE_FLAGS > /dev/null
 make install
 mkdir -p $FF_PREFIX/include/libffmpeg
 cp -f config.h $FF_PREFIX/include/libffmpeg/config.h
